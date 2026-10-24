@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include <stdarg.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -46,6 +47,35 @@ size_t Preferences::putUChar(const char* key, uint8_t value) {
             strncpy(s.key, key, sizeof(s.key) - 1);
             s.val = value;
             return 1;
+        }
+    return 0;
+}
+
+// ---- Preferences: tiny in-memory blob store (for getBytes/putBytes) ----
+#define PREF_BLOB_SLOTS 4
+#define PREF_BLOB_MAX   256
+static struct { char key[16]; uint8_t data[PREF_BLOB_MAX]; size_t len; bool used; } blob_store[PREF_BLOB_SLOTS];
+
+size_t Preferences::getBytes(const char* key, void* buf, size_t max_len) {
+    for (auto& s : blob_store)
+        if (s.used && strcmp(s.key, key) == 0) {
+            size_t n = s.len < max_len ? s.len : max_len;
+            memcpy(buf, s.data, n);
+            return n;
+        }
+    return 0;
+}
+size_t Preferences::putBytes(const char* key, const void* buf, size_t len) {
+    if (len > PREF_BLOB_MAX) len = PREF_BLOB_MAX;
+    for (auto& s : blob_store)
+        if (s.used && strcmp(s.key, key) == 0) { memcpy(s.data, buf, len); s.len = len; return len; }
+    for (auto& s : blob_store)
+        if (!s.used) {
+            s.used = true;
+            strncpy(s.key, key, sizeof(s.key) - 1);
+            memcpy(s.data, buf, len);
+            s.len = len;
+            return len;
         }
     return 0;
 }

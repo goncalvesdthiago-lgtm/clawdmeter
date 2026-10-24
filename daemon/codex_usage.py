@@ -42,7 +42,8 @@ def _tail_lines(path: Path, tail_bytes: int) -> list[bytes]:
 
 
 def _latest_event(paths: Iterable[Path], tail_bytes: int = TAIL_BYTES) -> dict | None:
-    newest: dict[str, tuple[float, dict]] = {}
+    newest = None
+    newest_stamp = 0.0
     for path in paths:
         try:
             lines = _tail_lines(path, tail_bytes)
@@ -60,12 +61,10 @@ def _latest_event(paths: Iterable[Path], tail_bytes: int = TAIL_BYTES) -> dict |
             stamp = _event_timestamp(event.get("timestamp"))
             if stamp is None or not isinstance(limits, dict):
                 continue
-            for window in WINDOW_PAYLOADS:
-                w_limit = limits.get(window)
-                if isinstance(w_limit, dict) and "used_percent" in w_limit and "resets_at" in w_limit:
-                    if window not in newest or stamp > newest[window][0]:
-                        newest[window] = (stamp, w_limit)
-    return {w: item[1] for w, item in newest.items()} if newest else None
+            if stamp > newest_stamp:
+                newest_stamp = stamp
+                newest = limits
+    return newest
 
 
 def _file_totals(path: Path) -> list[tuple[float, int]]:
@@ -105,14 +104,13 @@ def usage_payload(rate_limits: dict | None, now: float, tokens: dict | None = No
         return result
     for window, key in WINDOW_PAYLOADS.items():
         limit = rate_limits.get(window)
-        if not isinstance(limit, dict):
-            continue
+        spent = (tokens or {}).get(key, 0)
         try:
             used = min(100, max(0, round(float(limit["used_percent"]))))
             reset = float(limit["resets_at"])
         except (KeyError, TypeError, ValueError):
+            result[key] = [0, 0, spent]
             continue
-        spent = (tokens or {}).get(key, 0)
         if reset <= now:
             result[key] = [0, 0, 0]
         else:
@@ -155,6 +153,8 @@ class CodexUsage:
             try:
                 starts[key] = float(limit["resets_at"]) - float(limit["window_minutes"]) * 60
             except (KeyError, TypeError, ValueError):
+                if rate_limits is not None:
+                    starts[key] = now - (300 * 60 if key == "cxd" else 10080 * 60)
                 continue
         if not starts:
             return {}

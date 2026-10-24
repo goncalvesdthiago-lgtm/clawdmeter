@@ -443,6 +443,7 @@ static void format_reset_short_days(int days, char* buf, size_t len) {
 static void global_click_cb(lv_event_t* e);
 static void make_screen_draggable(lv_obj_t* c);
 static void screen_pressed_cb(lv_event_t* e);
+static void update_view_state(void);
 
 static lv_obj_t* make_panel(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_t* panel = lv_obj_create(parent);
@@ -2665,7 +2666,10 @@ void ui_update_peripherals(int mouse_pct, int keyboard_pct) {
 void ui_update(const UsageData* data) {
     if (!data->valid) return;
     data_ok = data->ok;
-    if (!data->ok) return;          // a {"ok":false} "no data" beat → fall through to idle, keep last numbers
+    if (!data->ok) {                // a {"ok":false} beat → idle, keep last numbers
+        update_view_state();
+        return;
+    }
     last_data_ms = lv_tick_get();   // a real usage update just landed
     data_received = true;
 
@@ -2760,6 +2764,8 @@ void ui_update(const UsageData* data) {
         lv_label_set_text(lbl_weekly_reset, buf);
         set_reset_hint(hint_weekly, data->weekly_reset_mins);
     }
+
+    update_view_state();
 }
 
 // Pick the usage-view sub-screen: pairing hint (BLE down), the idle "Zzz" screen
@@ -3090,7 +3096,11 @@ void ui_show_screen(screen_t screen) {
 
     switch (screen) {
     case SCREEN_SPLASH:  splash_show(); break;
-    case SCREEN_USAGE:   lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); scroll_list_show(&usage_list); break;
+    case SCREEN_USAGE:
+        lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
+        update_view_state();
+        if (!usage_rows_layout) scroll_list_show(&usage_list);
+        break;
     case SCREEN_AGENDA:  lv_obj_clear_flag(agenda_container, LV_OBJ_FLAG_HIDDEN); scroll_list_show(&agenda_list); break;
     case SCREEN_HISTORY: lv_obj_clear_flag(history_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_ROUTINES: lv_obj_clear_flag(routines_container, LV_OBJ_FLAG_HIDDEN); scroll_list_show(&routines_list); break;

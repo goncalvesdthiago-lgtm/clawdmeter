@@ -65,13 +65,28 @@ static NimBLECharacteristic* req_char = nullptr;
 static ble_state_t state = BLE_STATE_INIT;
 static bool need_advertise = false;
 
-// One-shot supervision-timeout pushback (see onConnParamsUpdate). Written by
+// Connection-parameter pushback (see arm_param_fix / onConnParamsUpdate). Written by
 // NimBLE host-task callbacks, consumed by ble_tick() on the loop task.
 static const uint16_t CONN_HANDLE_NONE  = 0xFFFF;
 static const uint16_t DESIRED_TIMEOUT   = 600;   // ×10ms = 6s, matches PPCP
+// Relaxed link: 75-105ms (×1.25ms), latency 0. The board only sends a rare
+// key tap and receives a payload once a minute, but at the central's default
+// HID pace (11.25-15ms) it claims a radio slot ~70×/s. On a Mac that also
+// carries a BLE mouse, other BLE keyboards and a headset in call mode (HFP
+// reserves fixed slots), that crowding starves the mouse. Latency stays 0:
+// slave latency only lets the peripheral sleep, the central still spends the
+// slot on every event, so only a longer interval frees the radio.
+static const uint16_t RELAXED_ITVL_MIN  = 60;    // 75ms
+static const uint16_t RELAXED_ITVL_MAX  = 84;    // 105ms
 static volatile uint16_t param_fix_handle = CONN_HANDLE_NONE;  // pending retry
 static volatile uint32_t param_fix_at_ms  = 0;                 // when to send it
-static volatile uint16_t param_fix_spent  = CONN_HANDLE_NONE;  // one per connection
+static volatile uint16_t param_fix_spent  = CONN_HANDLE_NONE;  // handle the tries belong to
+static volatile uint8_t  param_fix_tries  = 0;                 // requests sent on that handle
+// macOS re-clamps an HID link back to 15ms right after accepting the relaxed
+// interval, so one request isn't enough; a few spaced retries, then give up
+// (no update war).
+static const uint8_t  PARAM_FIX_MAX_TRIES = 3;
+static const uint32_t PARAM_FIX_DELAY_MS[PARAM_FIX_MAX_TRIES] = {2000, 10000, 30000};
 static char rx_buf[BLE_BUF_SIZE];
 static volatile bool data_ready = false;
 static volatile bool has_received_data = false;
@@ -177,6 +192,21 @@ static void start_advertising() {
         server ? (unsigned)server->getConnectedCount() : 0);
 }
 
+// Arm the deferred connection-parameter request (sent by ble_tick())
+// when the link is tighter than we want: short supervision timeout or a
+// faster interval than the relaxed range.
+static void arm_param_fix(NimBLEConnInfo& info) {
+    if (info.getConnTimeout() >= DESIRED_TIMEOUT &&
+        info.getConnInterval() >= RELAXED_ITVL_MIN) return;
+    if (info.getConnHandle() != param_fix_spent) {
+        param_fix_spent = info.getConnHandle();
+        param_fix_tries = 0;
+    }
+    if (param_fix_tries >= PARAM_FIX_MAX_TRIES) return;
+    param_fix_handle = info.getConnHandle();
+    param_fix_at_ms  = millis() + PARAM_FIX_DELAY_MS[param_fix_tries];
+}
+
 class ServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* s, NimBLEConnInfo& info) override {
         state = BLE_STATE_CONNECTED;
@@ -196,6 +226,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         if (s->getConnectedCount() < CONFIG_BT_NIMBLE_MAX_CONNECTIONS) {
             need_advertise = true;
         }
+        arm_param_fix(info);
     }
 
     void onDisconnect(NimBLEServer* s, NimBLEConnInfo& info, int reason) override {
@@ -205,7 +236,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         // Drop any pending/spent param pushback for this handle — NimBLE
         // reuses conn handles, so stale state would leak onto the next link.
         if (param_fix_handle == info.getConnHandle()) param_fix_handle = CONN_HANDLE_NONE;
-        if (param_fix_spent  == info.getConnHandle()) param_fix_spent  = CONN_HANDLE_NONE;
+        if (param_fix_spent  == info.getConnHandle()) { param_fix_spent = CONN_HANDLE_NONE; param_fix_tries = 0; }
         Serial.printf("BLE: disconnected (reason=%d, remaining=%u)\n",
             reason, (unsigned)s->getConnectedCount());
     }
@@ -215,21 +246,17 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     // active (captured on hardware; it honors 9.6s while only its HID driver
     // holds the link) — and a 2s window is tight enough that ordinary radio
     // gaps kill the link (HCI 0x208 → reason=520), which was the constant
-    // daemon reconnect churn. Push back ONCE per connection: schedule a
-    // deferred LL connection-parameter request for the same interval range but
-    // a 6s timeout (the mechanism Microsoft's accessory guidelines prescribe).
+    // daemon reconnect churn. Push back a few times per connection: schedule a
+    // deferred LL connection-parameter request for the relaxed interval range
+    // and a 6s timeout (the mechanism Microsoft's accessory guidelines prescribe).
     // Deferred ~2s so it can't race the central's own in-flight update
     // transaction (Windows has a documented late-instant bug there), and
-    // one-shot so a central that re-clamps doesn't trigger an update war.
+    // capped so a central that re-clamps doesn't trigger an update war.
     void onConnParamsUpdate(NimBLEConnInfo& info) override {
         Serial.printf("BLE: connparams update itvl=%u(%.2fms) lat=%u timeout=%u(%ums)\n",
             info.getConnInterval(), info.getConnInterval() * 1.25f,
             info.getConnLatency(), info.getConnTimeout(), info.getConnTimeout() * 10);
-        if (info.getConnTimeout() < DESIRED_TIMEOUT &&
-            info.getConnHandle() != param_fix_spent) {
-            param_fix_handle = info.getConnHandle();
-            param_fix_at_ms  = millis() + 2000;
-        }
+        arm_param_fix(info);
     }
 
     // Lock the board to a single owner machine. The first machine to bond
@@ -242,11 +269,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         // Bonded reconnects START at the central's clamped parameters (no
         // later update event fires), so the supervision-timeout pushback must
         // also arm here, not just in onConnParamsUpdate.
-        if (info.getConnTimeout() < DESIRED_TIMEOUT &&
-            info.getConnHandle() != param_fix_spent) {
-            param_fix_handle = info.getConnHandle();
-            param_fix_at_ms  = millis() + 2000;
-        }
+        arm_param_fix(info);
         if (id == ZERO_ADDR) return;
         if (!owner_set) {
             claim_owner(id);
@@ -370,15 +393,15 @@ void ble_tick(void) {
         need_advertise = false;
         start_advertising();
     }
-    // Deferred one-shot supervision-timeout pushback (see onConnParamsUpdate).
+    // Deferred connection-parameter pushback (see arm_param_fix).
     if (param_fix_handle != CONN_HANDLE_NONE &&
         (int32_t)(millis() - param_fix_at_ms) >= 0) {
         uint16_t h = param_fix_handle;
         param_fix_handle = CONN_HANDLE_NONE;
-        param_fix_spent  = h;
+        param_fix_tries++;
         if (server && server->getConnectedCount() > 0) {
-            Serial.println("BLE: requesting 6s supervision timeout");
-            server->updateConnParams(h, 12, 24, 0, DESIRED_TIMEOUT);
+            Serial.println("BLE: requesting relaxed interval + 6s supervision timeout");
+            server->updateConnParams(h, RELAXED_ITVL_MIN, RELAXED_ITVL_MAX, 0, DESIRED_TIMEOUT);
         }
     }
 }
